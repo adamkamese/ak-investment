@@ -209,8 +209,8 @@ const DB=()=>load();
    everyone. localStorage stays as an offline cache/fallback.
    ========================================================================== */
 const CLOUD={
-  url:"",                 // e.g.  https://abcdefghijkl.supabase.co
-  key:"",                 // the anon / public key (safe to expose in the page)
+  url:"https://gwsxqltdejwvhbzmlpyq.supabase.co",                 // e.g.  https://abcdefghijkl.supabase.co
+  key:"sb_publishable_t-Ts6E3Qxq6mXtRfSYY_aA_PD83PFZ2",                 // the anon / public key (safe to expose in the page)
   table:"app_state",
   row:"main"
 };
