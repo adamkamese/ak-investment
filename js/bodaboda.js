@@ -9,10 +9,10 @@ const BODA_TABS=[["Dashboard","dash"],["Drivers","people"],["Contracts","file"],
 registerModule({id:"bodaboda",icon:"scooter",name:"Bodaboda",live:true,title:"Bodaboda Business"},
   renderBodaboda);
 function renderBodaboda(m,el){
-  const R=resolveRange(), label=R[2], sel=selectedDrivers();
+  const R=resolveRange(), label=R[2];
   el.innerHTML='<h1 class="pg">'+esc(m.title)+'</h1>'+
     '<div class="meta">Date: '+esc(label)+'</div>'+
-    '<div class="meta">Driver(s): '+(FS.driverFilter==="All"?"All drivers":(sel.length?esc(sel.join(", ")):"None"))+'</div>'+
+    '<div class="meta">Driver(s): '+esc(filterLabel())+'</div>'+
     (canEdit()?"":'<div class="banner warn" style="margin-top:12px">'+ic("lock")+
       ' <b>View only.</b> This account cannot add or change records in this module.</div>')+
     '<div class="tabs">'+BODA_TABS.map((t,i)=>
@@ -201,51 +201,116 @@ function resolveRange(){
       FS.quarter+" "+y];}
   return [y+"-01-01",y+"-12-31",String(y)];
 }
+
+/* ---------------------------------------------------------------------
+   DRIVER / CONTRACT FILTER
+   The sidebar driver filter now picks CONTRACTS, not driver names.
+   - A driver with ONE contract appears once, as just their name.
+   - A driver with TWO OR MORE contracts appears once per contract,
+     labelled "Driver Name \u00B7 Contract ID", so each contract can be
+     filtered on its own.
+   FS.single holds one contract id; FS.multi holds an array of contract ids.
+   Older selections that still hold a driver NAME keep working: a name
+   expands to every contract that driver holds.
+   --------------------------------------------------------------------- */
+function contractChoices(){
+  const db=DB(), n=new Map();
+  db.contracts.forEach(c=>n.set(c.driverId,(n.get(c.driverId)||0)+1));
+  return db.contracts.map(c=>{
+    const dn=driverNameOf(c), many=(n.get(c.driverId)||0)>1, code=c.code||plateOf(c);
+    return {id:c.id,driverId:c.driverId,driverName:dn,code:code,multi:many,
+      label:many?dn+" \u00B7 "+code:dn};
+  }).sort((a,b)=>a.driverName.localeCompare(b.driverName)||a.code.localeCompare(b.code));
+}
+/* a stored filter value -> contract ids (contract id, or legacy driver name) */
+function expandChoice(v){
+  if(v==null||v==="") return [];
+  if(contractById(v)) return [v];
+  return DB().contracts.filter(c=>driverNameOf(c)===v).map(c=>c.id);
+}
+/* the set of contract ids the sidebar filter currently selects */
+function selectedContractIds(){
+  if(FS.driverFilter==="All") return new Set(DB().contracts.map(c=>c.id));
+  const raw=FS.driverFilter==="Single"?[FS.single]:(FS.multi||[]);
+  const s=new Set();
+  raw.forEach(v=>expandChoice(v).forEach(id=>s.add(id)));
+  return s;
+}
+/* labels of the selected contracts, for headers, banners and exports */
+function selectedLabels(){
+  const ids=selectedContractIds();
+  return contractChoices().filter(x=>ids.has(x.id)).map(x=>x.label);
+}
+function filterLabel(){
+  if(FS.driverFilter==="All") return "All drivers";
+  const l=selectedLabels();
+  return l.length?l.join(", "):"None";
+}
+/* <option> list for the sidebar Single / Multiple driver pickers in core.js:
+   value = contract id, text = driver name (plus contract ID when needed). */
+function contractOptionsHTML(selected){
+  const sel=new Set();
+  [].concat(selected==null?[]:selected).forEach(v=>expandChoice(v).forEach(id=>sel.add(id)));
+  return contractChoices().map(x=>'<option value="'+esc(x.id)+'"'+
+    (sel.has(x.id)?" selected":"")+'>'+esc(x.label)+'</option>').join("");
+}
+/* Legacy helper kept for any caller in core.js that still works in driver
+   names. Bodaboda views use selectedContractIds() / selectedLabels(). */
 function selectedDrivers(){
   const all=DB().drivers.map(d=>d.name).sort();
   if(FS.driverFilter==="All") return all;
   if(FS.driverFilter==="Single") return FS.single?[FS.single]:[];
   return FS.multi;
 }
+/* rollups limited to the selected contracts */
+function filteredRollups(){
+  const ids=selectedContractIds();
+  return allRollups().filter(r=>ids.has(r.contract.id));
+}
+
 const inRange=iso=>{const R=resolveRange();
   return dayNum(iso)>=dayNum(R[0])&&dayNum(iso)<=dayNum(R[1]);};
 /* deposit rows limited to the sidebar filters */
 function filteredDeposits(){
-  const names=new Set(selectedDrivers());
-  return depositRows().filter(r=>names.has(r.driverName)&&inRange(r.depositDate));
+  const ids=selectedContractIds();
+  return depositRows().filter(r=>ids.has(r.contractId)&&inRange(r.depositDate));
 }
 /* week rows limited to the sidebar filters */
 function filteredWeeks(){
-  const names=new Set(selectedDrivers()), out=[];
+  const ids=selectedContractIds(), out=[];
   allRollups().forEach(R=>{
-    const c=R.contract, dn=driverNameOf(c); if(!names.has(dn)) return;
+    const c=R.contract; if(!ids.has(c.id)) return;
+    const dn=driverNameOf(c);
     R.weeks.forEach(w=>{ if(inRange(w.weekStart))
       out.push(Object.assign({},w,{driverName:dn,plate:plateOf(c),code:c.code,
-        status:statusAt(c,w.weekEnd)})); });
+        contractId:c.id,status:statusAt(c,w.weekEnd)})); });
   });
   return out.sort((a,b)=>dayNum(a.weekStart)-dayNum(b.weekStart));
 }
+/* One row per selected CONTRACT (a driver with two contracts gets two rows,
+   each labelled with its contract ID). */
 function filteredDriverSummary(){
-  const names=new Set(selectedDrivers()), map=new Map();
+  const ids=selectedContractIds(), out=[];
+  const lab=new Map(contractChoices().map(x=>[x.id,x.label]));
   allRollups().forEach(R=>{
-    const c=R.contract, dn=driverNameOf(c); if(!names.has(dn)) return;
+    const c=R.contract; if(!ids.has(c.id)) return;
     const wk=R.weeks.filter(w=>inRange(w.weekStart));
     if(!wk.length) return;
-    const m=map.get(dn)||{name:dn,plates:new Set(),weeks:0,expected:0,deposited:0,
-      fines:0,finesPaid:0,late:0,fineMode:c.fineMode||"none",fineAmount:Number(c.fineAmount)||0,
+    const m={name:lab.get(c.id)||driverNameOf(c),driverName:driverNameOf(c),
+      driverId:c.driverId,contractId:c.id,code:c.code||"",plate:plateOf(c)||"\u2014",
+      weeks:0,expected:0,deposited:0,fines:0,finesPaid:0,late:0,
+      fineMode:c.fineMode||"none",fineAmount:Number(c.fineAmount)||0,
       dailyRate:Number(c.dailyRate)||0};
-    m.plates.add(plateOf(c));
     wk.forEach(w=>{ m.weeks++; m.expected+=w.expected; m.deposited+=w.deposited;
       m.fines+=w.fine; m.finesPaid+=w.finePaid; if(w.fine>0) m.late++; });
-    map.set(dn,m);
+    m.due=m.expected-m.deposited; m.finesOutstanding=m.fines-m.finesPaid;
+    out.push(m);
   });
-  return Array.from(map.values()).map(m=>Object.assign({},m,{
-    plate:Array.from(m.plates).join(", ")||"\u2014",
-    due:m.expected-m.deposited,finesOutstanding:m.fines-m.finesPaid}))
-    .sort((a,b)=>a.name.localeCompare(b.name));
+  return out.sort((a,b)=>a.driverName.localeCompare(b.driverName)||a.code.localeCompare(b.code));
 }
 const reportTotals=rows=>({
-  drivers:rows.length, weeks:rows.reduce((a,r)=>a+r.weeks,0),
+  drivers:new Set(rows.map(r=>r.driverId)).size, contracts:rows.length,
+  weeks:rows.reduce((a,r)=>a+r.weeks,0),
   expected:rows.reduce((a,r)=>a+r.expected,0), deposited:rows.reduce((a,r)=>a+r.deposited,0),
   due:rows.reduce((a,r)=>a+r.due,0), fines:rows.reduce((a,r)=>a+r.fines,0),
   finesPaid:rows.reduce((a,r)=>a+r.finesPaid,0),
@@ -282,13 +347,13 @@ function periodBuckets(){
   }
   return out;
 }
-/* expected vs deposited inside each bucket, for the selected drivers */
+/* expected vs deposited inside each bucket, for the selected contracts */
 function periodSeries(){
-  const b=periodBuckets(), names=new Set(selectedDrivers());
+  const b=periodBuckets(), ids=selectedContractIds();
   const exp=b.map(()=>0), dep=b.map(()=>0);
   const idx=iso=>b.findIndex(x=>dayNum(iso)>=dayNum(x.from)&&dayNum(iso)<=dayNum(x.to));
   allRollups().forEach(R=>{
-    if(!names.has(driverNameOf(R.contract))) return;
+    if(!ids.has(R.contract.id)) return;
     R.weeks.forEach(w=>{
       const i=idx(w.weekStart); if(i>=0) exp[i]+=w.expected;
       w.deposits.forEach(d=>{ const j=idx(d.depositDate);
@@ -298,10 +363,12 @@ function periodSeries(){
   return {labels:b.map(x=>x.label),expected:exp,deposited:dep};
 }
 
-/* averages by contract status, for the dashboard cards */
-function statsByStatus(){
+/* averages by contract status, for the dashboard cards
+   (pass a list of rollups to limit it, e.g. the filtered contracts) */
+function statsByStatus(list){
+  const all=list||allRollups();
   const g={active:[],terminated:[],completed:[]};
-  allRollups().forEach(R=>{ (g[R.contract.status]||(g[R.contract.status]=[])).push(R); });
+  all.forEach(R=>{ (g[R.contract.status]||(g[R.contract.status]=[])).push(R); });
   const agg=list=>{
     const n=list.length||1;
     const w=list.reduce((a,r)=>a+r.weeksOperated,0);
@@ -315,17 +382,26 @@ function statsByStatus(){
       avgWeeks:w/n,avgExpected:e/n,avgDeposited:d/n,avgOutstanding:o/n};
   };
   return {active:agg(g.active||[]),terminated:agg(g.terminated||[]),
-    completed:agg(g.completed||[]),all:agg(allRollups())};
+    completed:agg(g.completed||[]),all:agg(all)};
 }
 
 /* ===================== DASHBOARD ===================== */
 function tabDashboard(){
-  const R=allRollups(); if(!R.length) return emptyState();
-  const db=DB(), S=statsByStatus();
-  const V=allVehicleRollups();
+  const db=DB(); if(!db.contracts.length) return emptyState();
+  /* everything on the dashboard follows the sidebar contract filter */
+  const R=filteredRollups();
+  const noMatch=!R.length?'<div class="banner warn" style="margin-bottom:16px">'+
+    'No contracts match the current driver filter.</div>':"";
+  const S=statsByStatus(R);
+  const filtered=FS.driverFilter!=="All";
+  const vehIds=new Set(R.map(r=>r.contract.vehicleId||r.contract.bikeId));
+  const allV=allVehicleRollups();
+  /* vehicles: all of them when unfiltered, otherwise only the motorcycles
+     used by the selected contracts */
+  const V=filtered?allV.filter(v=>vehIds.has(v.vehicle.id)):allV;
   const activeVeh=V.filter(v=>v.active).length;
-  const drvIds=new Set(db.contracts.map(c=>c.driverId));
-  const activeDrv=new Set(db.contracts.filter(c=>c.status==="active").map(c=>c.driverId));
+  const drvIds=new Set(R.map(r=>r.contract.driverId));
+  const activeDrv=new Set(R.filter(r=>r.contract.status==="active").map(r=>r.contract.driverId));
   const weeks=R.reduce((a,r)=>a+r.weeksOperated,0);
   const exp=R.reduce((a,r)=>a+r.expectedToDate,0);
   const dep=R.reduce((a,r)=>a+r.totalDeposited,0);
@@ -341,12 +417,14 @@ function tabDashboard(){
       o:Math.max(v.totalExpected-v.totalDeposited,0)}))
     .sort((a,b)=>b.e-a.e).slice(0,10);
 
+  const lab=new Map(contractChoices().map(x=>[x.id,x]));
   const q=TXT.dash;
-  const rows=R.map(r=>{const c=r.contract;
+  const rows=R.map(r=>{const c=r.contract, ch=lab.get(c.id);
     return {name:driverNameOf(c),plate:plateOf(c),code:c.code||"",status:c.status,
+      multi:!!(ch&&ch.multi),cid:c.id,
       w:r.weeksOperated,e:r.expectedToDate,dp:r.totalDeposited,du:r.amountDueToDate,did:c.driverId};})
     .filter(r=>matches([r.name,r.plate,r.code].join(" "),q))
-    .sort((a,b)=>a.name.localeCompare(b.name));
+    .sort((a,b)=>a.name.localeCompare(b.name)||a.code.localeCompare(b.code));
 
   const vq=TXT.veh;
   const vrows=V.filter(v=>matches([v.vehicle.plate,v.currentDriver,v.vehicle.model||"",
@@ -354,11 +432,12 @@ function tabDashboard(){
 
   return '<div class="btnrow" style="margin-bottom:18px">'+depositBtn+
       '<button class="btn" data-act="goReports">'+ic("chart")+' Go to Reports</button></div>'+
+    noMatch+
     '<h3 class="sec">Summary</h3>'+
     '<div class="kpis">'+
-      kpi("k1","Total Number of Vehicles",db.vehicles.length,"Active vehicles: "+activeVeh)+
+      kpi("k1","Total Number of Vehicles",V.length,"Active vehicles: "+activeVeh)+
       kpi("k2","Total Weeks Operated",weeks.toFixed(1),
-        "Drivers: "+drvIds.size+" / active "+activeDrv.size)+
+        "Drivers: "+drvIds.size+" / active "+activeDrv.size+" \u00B7 contracts: "+R.length)+
       kpi("k3","Total Expected to Date (TZS)",money(exp))+
       kpi("k4","Total Deposited Earnings (TZS)",money(dep),"Outstanding: "+money(out))+'</div>'+
 
@@ -414,7 +493,11 @@ function tabDashboard(){
     filterBox("dash","Filter by plate, driver or contract ID\u2026")+
     table(["Driver Name","Plate","Contract ID","Contract Status","Total Weeks Operated",
       "Total Expected (to date)","Total Deposited Earnings","Total Amount Due",""],
-      rows.map(r=>['<a class="lnk" data-act="drillDriver" data-id="'+r.did+'">'+esc(r.name)+'</a>',
+      rows.map(r=>[
+        /* the name opens THIS contract's deposits, so a driver with two
+           contracts gets two separate drill-downs */
+        '<a class="lnk" data-act="drillDriver" data-id="'+r.cid+'">'+esc(r.name)+'</a>'+
+          (r.multi?' <span class="hint" style="display:inline">('+esc(r.code)+')</span>':""),
         esc(r.plate),esc(r.code),statusLabel(r.status),{n:r.w.toFixed(1)},{n:money(r.e)},
         {n:money(r.dp)},bal(-r.du),
         '<button class="btn sm" data-act="viewDriver" data-id="'+r.did+'">'+
@@ -422,15 +505,20 @@ function tabDashboard(){
     '';
 }
 
-/* floating, editable deposit table for one driver */
-function drillDriver(driverId){
-  const d=driverById(driverId); if(!d) return;
-  const rows=depositRows().filter(r=>r.driverId===driverId&&inRange(r.depositDate));
+/* floating, editable deposit table.
+   Pass a CONTRACT id to see that one contract, or a DRIVER id to see every
+   contract the driver holds. */
+function drillDriver(id){
+  const c=contractById(id);
+  const d=driverById(c?c.driverId:id); if(!d) return;
+  const rows=depositRows().filter(r=>(c?r.contractId===c.id:r.driverId===d.id)&&
+    inRange(r.depositDate));
   const R=resolveRange();
   const tot=rows.reduce((a,r)=>a+r.amount,0);
-  openModal(d.name+" \u2014 deposits",
-    '<div class="banner">Period <b>'+esc(R[2])+'</b> \u00B7 '+rows.length+' deposit(s) \u00B7 total <b>'+
-      tzs(tot)+'</b></div>'+
+  openModal(d.name+(c?" \u00B7 "+(c.code||plateOf(c)):"")+" \u2014 deposits",
+    '<div class="banner">Period <b>'+esc(R[2])+'</b>'+
+      (c?' \u00B7 contract <b>'+esc(c.code||plateOf(c))+'</b>':' \u00B7 all contracts')+
+      ' \u00B7 '+rows.length+' deposit(s) \u00B7 total <b>'+tzs(tot)+'</b></div>'+
     table(["Week Start","Week End","Deposit Date","Contract ID","Plate","Status","Amount",
       "Fine Paid","Balance to Date",""],
       rows.map(r=>[fmtDate(r.weekStart),fmtDate(r.weekEnd),fmtDate(r.depositDate),
@@ -440,6 +528,8 @@ function drillDriver(driverId){
           '</button> <button class="btn sm dang" data-act="delDep" data-id="'+r.id+'">'+
           ic("trash",13)+'</button>'):""]))+
     '<div class="btnrow" style="margin-top:16px">'+
+      (c?'<button class="btn" data-act="drillDriver" data-id="'+d.id+'">'+ic("file",14)+
+        ' All of '+esc(d.name)+'\u2019s contracts</button>':"")+
       '<button class="btn" data-act="closeModal">Close</button></div>',true);
 }
 
@@ -473,12 +563,14 @@ function viewDriver(driverId){
     '</tbody></table>'+
     (mine.length?'<h3 class="sec" style="font-size:16px">Contracts</h3>'+
       table(["Contract ID","Plate","Status","Start","End","Weeks","Total Expected",
-        "Expected to Date","Deposited","Outstanding"],
+        "Expected to Date","Deposited","Outstanding",""],
         mine.map(r=>{const c=r.contract;
           return [esc(c.code||""),esc(plateOf(c)),statusLabel(c.status),
             fmtDate(c.startDate),fmtDate(c.terminatedOn||c.endDate),{n:r.weeksOperated.toFixed(1)},
             {n:money(r.totalExpected)},{n:money(r.expectedToDate)},
-            {n:money(r.totalDeposited)},bal(-r.amountDueToDate)];})):"")+
+            {n:money(r.totalDeposited)},bal(-r.amountDueToDate),
+            '<button class="btn sm" data-act="drillDriver" data-id="'+c.id+'">'+ic("file",13)+
+              ' Deposits</button>'];})):"")+
     (recent.length?'<h3 class="sec" style="font-size:16px">Recent deposits</h3>'+
       table(["Deposit Date","Week Start","Plate","Contract ID","Amount","Fine Paid"],
         recent.map(r=>[fmtDate(r.depositDate),fmtDate(r.weekStart||mondayOfWeek(r.depositDate)),
@@ -539,15 +631,14 @@ function viewVehicle(id){
 
 /* ===================== DRIVERS ===================== */
 function tabDrivers(){
-  const db=DB(), R=allRollups();
-  const sel=new Set(selectedDrivers());
-  const mine=R.filter(r=>sel.has(driverNameOf(r.contract)));
+  /* KPIs follow the sidebar contract filter */
+  const mine=filteredRollups();
   const weeks=mine.reduce((a,r)=>a+r.weeksOperated,0);
   const exp=mine.reduce((a,r)=>a+r.expectedToDate,0);
   const dep=mine.reduce((a,r)=>a+r.totalDeposited,0);
   const due=mine.reduce((a,r)=>a+r.amountDueToDate,0);
-  const drvIds=new Set(db.contracts.map(c=>c.driverId));
-  const activeDrv=new Set(db.contracts.filter(c=>c.status==="active").map(c=>c.driverId));
+  const drvIds=new Set(mine.map(r=>r.contract.driverId));
+  const activeDrv=new Set(mine.filter(r=>r.contract.status==="active").map(r=>r.contract.driverId));
 
   const q=TXT.drv;
   const rows=filteredDeposits().filter(r=>
@@ -560,7 +651,7 @@ function tabDrivers(){
     '<h3 class="sec">Summary</h3>'+
     '<div class="kpis">'+
       kpi("k2","Total Weeks Operated",weeks.toFixed(1),
-        "Drivers: "+drvIds.size+" / active "+activeDrv.size)+
+        "Drivers: "+drvIds.size+" / active "+activeDrv.size+" \u00B7 contracts: "+mine.length)+
       kpi("k3","Total Expected to Date (TZS)",money(exp))+
       kpi("k1","Total Deposited Earnings (TZS)",money(dep))+
       kpi("k4","Total Amount Due",money(due))+'</div>'+
@@ -1060,7 +1151,7 @@ function tabReports(){
   const deps=filteredDeposits();
   return '<div class="banner">Reporting period: <b>'+esc(periodLabel())+'</b> ('+
       esc(dmy(R[0]))+' \u2013 '+esc(dmy(R[1]))+') \u00B7 '+
-      (FS.driverFilter==="All"?"all drivers":esc(selectedDrivers().join(", ")||"none"))+
+      (FS.driverFilter==="All"?"all drivers":esc(filterLabel()))+
       '. Every export carries this period in its header.</div>'+
     '<div class="btnrow" style="margin-bottom:20px">'+
       '<button class="btn pri" data-act="exportPdf">'+ic("printer")+' Export PDF</button>'+
@@ -1069,7 +1160,7 @@ function tabReports(){
       depositBtn+'</div>'+
     '<h3 class="sec">Report Summary</h3>'+
     '<div class="kpis">'+
-      kpi("k1","Drivers in Report",T.drivers)+
+      kpi("k1","Drivers in Report",T.drivers,"Contracts: "+T.contracts)+
       kpi("k2","Weeks Covered",T.weeks)+
       kpi("k3","Total Expected Earnings (TZS)",money(T.expected))+
       kpi("k4","Total Deposited Earnings (TZS)",money(T.deposited))+'</div>'+
@@ -1085,11 +1176,11 @@ function tabReports(){
         esc(r.code),esc(r.driverName),esc(r.plate),statusLabel(r.status),
         {n:money(r.amount)},{n:money(r.finePaid)},bal(r.balance)]))+
     '<div class="hint" style="margin-top:8px">'+deps.length+' deposit(s) in this period.</div>'+
-    '<h3 class="sec">Per-driver breakdown</h3>'+
-    table(["Driver Name","Plate","Weeks","Expected","Deposited","Balance","Fine",
+    '<h3 class="sec">Per-driver breakdown (one row per contract)</h3>'+
+    table(["Driver Name","Contract ID","Plate","Weeks","Expected","Deposited","Balance","Fine",
       "Fines Charged","Fines Paid","Fines Outstanding","Late Weeks"],
-      sum.map(r=>[esc(r.name),esc(r.plate),{n:r.weeks},{n:money(r.expected)},{n:money(r.deposited)},
-        bal(-r.due),
+      sum.map(r=>[esc(r.driverName),esc(r.code),esc(r.plate),{n:r.weeks},{n:money(r.expected)},
+        {n:money(r.deposited)},bal(-r.due),
         {n:r.fineMode==="none"?"None":money(r.fineAmount)+"/"+(r.fineMode==="weekly"?"wk":"day")},
         {n:money(r.fines)},{n:money(r.finesPaid)},
         {n:money(r.finesOutstanding),cls:r.finesOutstanding>0?"neg":""},{n:r.late}]));
@@ -1475,26 +1566,32 @@ function toCsv(rows){
     const s=String(v); return /[",\n]/.test(s)?'"'+s.replace(/"/g,'""')+'"':s;
   }).join(",")).join("\n");
 }
-/* report rows: summary block then every deposit in the period */
+/* report rows: summary block, per-contract breakdown, then every deposit in the period */
 function reportRows(){
   const sum=filteredDriverSummary(), T=reportTotals(sum), R=resolveRange(), deps=filteredDeposits();
   const B=1,H=3,TT=4;
   const out=[[{t:"Bodaboda Driver Report",s:TT}],
     [{t:"Reporting Period",s:B},{t:periodLabel()}],
     [{t:"Date Range",s:B},{t:dmy(R[0])+" \u2013 "+dmy(R[1])}],
-    [{t:"Drivers",s:B},{t:FS.driverFilter==="All"?"All drivers":(selectedDrivers().join(", ")||"None")}],
+    [{t:"Drivers",s:B},{t:filterLabel()}],
     [{t:"Generated",s:B},{t:fmtDate(today())}],[],
     [{t:"SUMMARY",s:H}],
-    [{t:"Drivers in Report",s:B},T.drivers],[{t:"Weeks Covered",s:B},T.weeks],
+    [{t:"Drivers in Report",s:B},T.drivers],[{t:"Contracts in Report",s:B},T.contracts],
+    [{t:"Weeks Covered",s:B},T.weeks],
     [{t:"Total Expected Earnings (TZS)",s:B},T.expected],
     [{t:"Total Deposited Earnings (TZS)",s:B},T.deposited],
     [{t:"Total Amount Due (TZS)",s:B},T.due],
     [{t:"Fines Charged (TZS)",s:B},T.fines],
     [{t:"Fines Outstanding (TZS)",s:B},T.finesOutstanding],
     [{t:"Late Weeks",s:B},T.late],[],
-    [{t:"DEPOSITS IN PERIOD",s:H}],
+    [{t:"PER CONTRACT",s:H}],
+    ["Driver Name","Contract ID","Plate","Weeks","Expected","Deposited","Amount Due",
+     "Fines Charged","Fines Paid","Fines Outstanding","Late Weeks"].map(h=>({t:h,s:H}))];
+  sum.forEach(r=>out.push([{t:r.driverName},{t:r.code},{t:r.plate},r.weeks,r.expected,
+    r.deposited,r.due,r.fines,r.finesPaid,r.finesOutstanding,r.late]));
+  out.push([],[{t:"DEPOSITS IN PERIOD",s:H}],
     ["Deposit Date","Contract ID","Driver Name","Plate","Week Start","Week End",
-     "Amount Deposited","Fine Paid","Balance to Date"].map(h=>({t:h,s:H}))];
+     "Amount Deposited","Fine Paid","Balance to Date"].map(h=>({t:h,s:H})));
   deps.forEach(r=>out.push([{t:fmtDate(r.depositDate)},{t:r.code},{t:r.driverName},{t:r.plate},
     {t:fmtDate(r.weekStart)},{t:fmtDate(r.weekEnd)},r.amount,r.finePaid,r.balance]));
   out.push([{t:"TOTAL",s:B},{t:" "},{t:" "},{t:" "},{t:" "},{t:" "},
@@ -1539,7 +1636,8 @@ function driverRows(){
   const B=1,H=3,TT=4, deps=filteredDeposits(), R=resolveRange();
   const out=[[{t:"Driver Deposit Register",s:TT}],
     [{t:"Reporting Period",s:B},{t:periodLabel()}],
-    [{t:"Date Range",s:B},{t:dmy(R[0])+" \u2013 "+dmy(R[1])}],[],
+    [{t:"Date Range",s:B},{t:dmy(R[0])+" \u2013 "+dmy(R[1])}],
+    [{t:"Drivers",s:B},{t:filterLabel()}],[],
     ["Driver Name","Plate","Contract ID","Status","Week Start","Week End","Deposit Date",
      "Amount Deposited","Balance to Date"].map(h=>({t:h,s:H}))];
   deps.forEach(r=>out.push([{t:r.driverName},{t:r.plate},{t:r.code},{t:r.status},
@@ -1596,7 +1694,8 @@ function openPrint(html){
 function exportPdf(){
   const sum=filteredDriverSummary(), T=reportTotals(sum), R=resolveRange(), deps=filteredDeposits();
   openPrint(printDoc("Bodaboda Driver Report",
-    [["Drivers in Report",String(T.drivers)],["Weeks Covered",String(T.weeks)],
+    [["Drivers in Report",String(T.drivers)],["Contracts in Report",String(T.contracts)],
+     ["Weeks Covered",String(T.weeks)],
      ["Total Expected (TZS)",money(T.expected)],["Total Deposited (TZS)",money(T.deposited)],
      ["Total Amount Due (TZS)",money(T.due)],["Fines Charged (TZS)",money(T.fines)],
      ["Fines Outstanding (TZS)",money(T.finesOutstanding)],["Late Weeks",String(T.late)]],
@@ -1606,7 +1705,7 @@ function exportPdf(){
       fmtDate(r.weekEnd),{n:1,t:money(r.amount)},{n:1,t:money(r.finePaid)},{n:1,t:balText(r.balance)}]),
     ["Reporting period: "+periodLabel(),
      "Date range: "+dmy(R[0])+" \u2013 "+dmy(R[1]),
-     "Drivers: "+(FS.driverFilter==="All"?"All drivers":(selectedDrivers().join(", ")||"None")),
+     "Drivers: "+filterLabel(),
      "Generated: "+fmtDate(today()),deps.length+" deposit(s)"]));
 }
 function exportContractsPdf(){
@@ -1631,19 +1730,21 @@ function exportContractsPdf(){
 }
 function exportDriversPdf(){
   const deps=filteredDeposits(), R=resolveRange();
-  const db=DB();
+  const T=reportTotals(filteredDriverSummary());
+  const sel=filteredRollups();
   openPrint(printDoc("Driver Deposit Register",
     [["Reporting Period",periodLabel()],["Date Range",dmy(R[0])+" \u2013 "+dmy(R[1])],
      ["Deposits",String(deps.length)],
      ["Total Deposited (TZS)",money(deps.reduce((a,r)=>a+r.amount,0))],
-     ["Total Amount Due (TZS)",money(deps.reduce((a,r)=>a+r.amountDue,0))],
-     ["Drivers",String(db.drivers.length)],
-     ["Active Drivers",String(new Set(db.contracts.filter(c=>c.status==="active")
-       .map(c=>c.driverId)).size)]],
+     ["Total Amount Due (TZS)",money(T.due)],
+     ["Drivers",String(new Set(sel.map(r=>r.contract.driverId)).size)],
+     ["Contracts",String(sel.length)],
+     ["Active Drivers",String(new Set(sel.filter(r=>r.contract.status==="active")
+       .map(r=>r.contract.driverId)).size)]],
     [{t:"Driver Name"},{t:"Plate"},{t:"Contract ID"},{t:"Status"},{t:"Week Start"},{t:"Week End"},
      {t:"Deposit Date"},{t:"Amount Deposited",n:1},{t:"Balance to Date",n:1}],
     deps.map(r=>[r.driverName,r.plate,r.code,r.status,fmtDate(r.weekStart),fmtDate(r.weekEnd),
       fmtDate(r.depositDate),{n:1,t:money(r.amount)},{n:1,t:balText(r.balance)}]),
-    ["Reporting period: "+periodLabel(),"Generated: "+fmtDate(today())]));
+    ["Reporting period: "+periodLabel(),"Drivers: "+filterLabel(),
+     "Generated: "+fmtDate(today())]));
 }
-
