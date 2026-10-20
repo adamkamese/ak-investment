@@ -23,6 +23,34 @@ function renderBodaboda(m,el){
 
 
 /* =======================================================================
+   EXPECTED EARNINGS - by days under contract
+   Every expected figure = (days the driver is under contract) x daily rate.
+   The window runs from the start date to the end date, or to the
+   termination/completion date once the contract is closed. Both ends count.
+   ======================================================================= */
+function contractWindow(c){
+  const start=c.startDate;
+  let end=c.endDate||contractEndDate(c.startDate,
+    Number(c.durationMonths)||0,Number(c.durationWeeks)||0);
+  if(c.status!=="active"&&c.terminatedOn) end=c.terminatedOn;
+  return {start:start,end:end||start};
+}
+/* inclusive count of contract days that fall between from and to */
+function contractDaysBetween(c,from,to){
+  const W=contractWindow(c);
+  const a=Math.max(dayNum(W.start),dayNum(from));
+  const b=Math.min(dayNum(W.end),dayNum(to));
+  return b>=a?b-a+1:0;
+}
+const contractDays=c=>{const W=contractWindow(c);return contractDaysBetween(c,W.start,W.end);};
+const contractDaysToDate=c=>{const W=contractWindow(c);return contractDaysBetween(c,W.start,today());};
+const dayRateOf=c=>Number(c.dailyRate)||0;
+const weekExpectedByDays=(c,ws)=>contractDaysBetween(c,ws,addDays(ws,6))*dayRateOf(c);
+const expectedTotalByDays=c=>contractDays(c)*dayRateOf(c);
+const expectedToDateByDays=c=>contractDaysToDate(c)*dayRateOf(c);
+
+
+/* =======================================================================
    ROLLUP - deposits grouped into weeks, fines assessed at week close
    ======================================================================= */
 function contractRollup(c){
@@ -45,7 +73,8 @@ function contractRollup(c){
   let carry=0,tExp=0,tDep=0,tFine=0,tFinePaid=0,late=0,weeksCounted=0,tLateDays=0;
   const weeks=keys.map(ws=>{
     const b=byWeek.get(ws);
-    const expected=weekExpected(c,ws);
+    /* expected = days of this week that fall under the contract x daily rate */
+    const expected=weekExpectedByDays(c,ws);
     const weekEnd=addDays(ws,6);
     /* A week is only closed once its Sunday has passed. */
     const closed=dayNum(weekEnd)<dayNum(td);
@@ -55,7 +84,7 @@ function contractRollup(c){
     const paidBySunday=b.deposits.reduce((a,r)=>
       dayNum(r.depositDate)<=dayNum(weekEnd)?a+(Number(r.amount)||0):a,0);
     const shortfall=Math.max(due-paidBySunday,0);
-    const daysOwed=(Number(c.dailyRate)||0)>0?Math.round(expected/(Number(c.dailyRate)||1)):0;
+    const daysOwed=contractDaysBetween(c,ws,weekEnd);
     const fine=closed?weekFineFor(c,shortfall,daysOwed):0;
     const finePaid=b.deposits.reduce((a,r)=>a+(Number(r.finePaid)||0),0);
     carry=Math.max(due-b.deposited,0);
@@ -71,25 +100,27 @@ function contractRollup(c){
     const cumBalance=tDep-tExp;
     return {weekStart:ws,weekEnd:weekEnd,expected:expected,carriedIn:due-expected,
       dueThisWeek:due+fine,deposited:b.deposited,paidBySunday:paidBySunday,
-      fine:fine,finePaid:finePaid,lateDays:lateDays,
+      fine:fine,finePaid:finePaid,lateDays:lateDays,daysUnderContract:daysOwed,
       balance:cumBalance,weekBalance:b.deposited-expected,
       cumExpected:tExp,cumDeposited:tDep,cumFine:tFine,cumFinePaid:tFinePaid,
       cumLateDays:tLateDays,carryOut:carry,closed:closed,
       deposits:b.deposits,count:b.deposits.length};
   });
   const endRef=closeISO||td;
-  /* Contract total expected = duration x daily earning (to the termination
-     date once closed). Outstanding and % repaid are measured against THIS,
-     not the motorcycle purchase price. */
-  const expectedTotal=contractExpectedTotal(c);
-  const expectedTD=contractExpectedToDate(c);
+  /* Contract total expected = days under contract x daily earning (to the
+     termination date once closed). Outstanding and % repaid are measured
+     against THIS, not the motorcycle purchase price. */
+  const expectedTotal=expectedTotalByDays(c);
+  const expectedTD=expectedToDateByDays(c);
   return {contract:c, weeks:weeks,
     weeksOperated:computeWeeks(c.startDate,endRef<c.startDate?c.startDate:endRef),
     weeksCounted:weeksCounted,
+    contractDays:contractDays(c),
+    daysToDate:contractDaysToDate(c),
     weeklyExpectedSum:tExp,
-    /* Expected EARNED so far, measured by duration operated up to date: to today
-       for an active contract, to the close date for a terminated/completed one
-       (so a closed contract's to-date equals its full total). */
+    /* Expected EARNED so far, measured by days under contract up to date: to
+       today for an active contract, to the close date for a terminated/completed
+       one (so a closed contract's to-date equals its full total). */
     expectedToDate:expectedTD,
     amountDueToDate:expectedTD-tDep,
     percentToDate:expectedTD?tDep/expectedTD*100:0,
@@ -535,13 +566,14 @@ function drillDriver(id){
 
 /* floating driver detail card: a driver-level mirror of the vehicle card,
    built from every contract the driver holds. Expected is shown both to date
-   (weeks operated so far) and at full term. */
+   (days under contract so far) and at full term. */
 function viewDriver(driverId){
   const d=driverById(driverId); if(!d) return;
   const mine=allRollups().filter(r=>r.contract.driverId===driverId);
   const sum=k=>mine.reduce((a,r)=>a+r[k],0);
   const weeks=sum("weeksOperated"), expTD=sum("expectedToDate"), expFull=sum("totalExpected");
   const dep=sum("totalDeposited"), dueTD=sum("amountDueToDate"), finesOut=sum("finesOutstanding");
+  const days=sum("contractDays"), daysTD=sum("daysToDate");
   const plates=Array.from(new Set(mine.map(r=>plateOf(r.contract)))).join(", ")||"\u2014";
   const active=mine.filter(r=>r.contract.status==="active").length;
   const recent=depositRows().filter(r=>r.driverId===driverId)
@@ -549,6 +581,7 @@ function viewDriver(driverId){
   const kv=[["Driver Name",esc(d.name)],["Phone",esc(d.phone||"\u2014")],
     ["Plate(s)",esc(plates)],["Contracts",mine.length+" ("+active+" active)"],
     ["Total Weeks Operated",weeks.toFixed(1)],
+    ["Days Under Contract",days+" ("+daysTD+" to date)"],
     ["Expected to Date",tzs(expTD)],["Expected (full term)",tzs(expFull)],
     ["Total Deposited",tzs(dep)],["Outstanding to Date",balText(-dueTD)],
     ["Fines Outstanding",tzs(finesOut)],
@@ -562,11 +595,12 @@ function viewDriver(driverId){
       '<tr><td style="color:var(--muted)">'+x[0]+'</td><td><b>'+x[1]+'</b></td></tr>').join("")+
     '</tbody></table>'+
     (mine.length?'<h3 class="sec" style="font-size:16px">Contracts</h3>'+
-      table(["Contract ID","Plate","Status","Start","End","Weeks","Total Expected",
+      table(["Contract ID","Plate","Status","Start","End","Days","Weeks","Total Expected",
         "Expected to Date","Deposited","Outstanding",""],
         mine.map(r=>{const c=r.contract;
           return [esc(c.code||""),esc(plateOf(c)),statusLabel(c.status),
-            fmtDate(c.startDate),fmtDate(c.terminatedOn||c.endDate),{n:r.weeksOperated.toFixed(1)},
+            fmtDate(c.startDate),fmtDate(c.terminatedOn||c.endDate),{n:r.contractDays},
+            {n:r.weeksOperated.toFixed(1)},
             {n:money(r.totalExpected)},{n:money(r.expectedToDate)},
             {n:money(r.totalDeposited)},bal(-r.amountDueToDate),
             '<button class="btn sm" data-act="drillDriver" data-id="'+c.id+'">'+ic("file",13)+
@@ -618,10 +652,10 @@ function viewVehicle(id){
       +'<div class="hint" style="margin-top:6px">Total repair cost <b>'+money(V.repairCost)+
         '</b>, added to the purchase price for a total cost of <b>'+money(V.totalCost)+'</b>.</div>':"")+
     (V.contracts.length?'<h3 class="sec" style="font-size:16px">Contracts on this vehicle</h3>'+
-      table(["Contract ID","Driver","Status","Start","End","Expected","Deposited","Outstanding"],
+      table(["Contract ID","Driver","Status","Start","End","Days","Expected","Deposited","Outstanding"],
         V.contracts.map(c=>{const r=contractRollup(c);
           return [esc(c.code||""),esc(driverNameOf(c)),statusLabel(c.status),
-            fmtDate(c.startDate),fmtDate(c.terminatedOn||c.endDate),
+            fmtDate(c.startDate),fmtDate(c.terminatedOn||c.endDate),{n:r.contractDays},
             {n:money(r.totalExpected)},{n:money(r.totalDeposited)},bal(-r.amountDue)];})):"")+
     '<div class="btnrow" style="margin-top:16px">'+
       (canEdit()?'<button class="btn pri" data-act="editVehicle" data-id="'+v.id+'">'+
@@ -679,34 +713,39 @@ function tabContracts(){
   if(!R.length) return h+'<div class="empty"><b>No contracts yet</b>Create one above.</div>';
   h+='<h3 class="sec">Contracts</h3>'+
     table(["Contract ID","Driver Name","Phone","Plate","Status","Start Date","End Date",
-      "Duration","Daily Rate","Fine","Total Expected","Expected to Date","Deposited","Outstanding","%",""],
+      "Duration","Days","Daily Rate","Fine","Total Expected","Expected to Date","Deposited",
+      "Outstanding","%",""],
       R.map(r=>{const c=r.contract,d=driverById(c.driverId);
         const dur=(c.durationMonths?c.durationMonths+"m ":"")+(c.durationWeeks?c.durationWeeks+"w":"");
         const fin=c.fineMode==="none"?"None"
           :(c.fineMode==="weekly"?money(c.fineAmount)+" / week":money(c.fineAmount)+" / day");
         return [esc(c.code||""),esc(d?d.name:"?"),esc((d&&d.phone)||c.driverPhone||"\u2014"),
           esc(plateOf(c)),statusLabel(c.status),fmtDate(c.startDate),
-          fmtDate(c.status==="terminated"&&c.terminatedOn?c.terminatedOn:c.endDate),
-          (dur.trim()||"\u2014"),{n:money(c.dailyRate)},{n:fin},{n:money(r.totalExpected)},
+          fmtDate(c.status!=="active"&&c.terminatedOn?c.terminatedOn:c.endDate),
+          (dur.trim()||"\u2014"),{n:r.contractDays},{n:money(c.dailyRate)},{n:fin},
+          {n:money(r.totalExpected)},
           {n:money(r.expectedToDate)},
           {n:money(r.totalDeposited)},bal(-r.amountDue),
           {n:r.percent.toFixed(1)+"%"},
           '<button class="btn sm" data-act="viewContract" data-id="'+c.id+'">'+ic("eye",13)+'</button> '+
           (canEdit()?'<button class="btn sm" data-act="editContract" data-id="'+c.id+'">'+
             ic("pencil",13)+'</button>':"")];}))+
+    '<div class="hint" style="margin-top:8px">Total Expected = days under contract \u00D7 '+
+      'daily rate. Expected to Date counts only the days up to today (or to the closing date).</div>'+
     '<h3 class="sec">Week-by-week ledger</h3>'+
     R.filter(r=>r.weeks.length).map(r=>{
       const c=r.contract;
       return '<details class="expander"><summary>'+esc(c.code||plateOf(c))+' \u2014 '+
         esc(driverNameOf(c))+' ('+r.weeksCounted+' weeks, '+tzs(r.outstandingCarry)+' carried)</summary>'+
         '<div class="body">'+
-        table(["Week Start","Week End","Status","Expected","Deposits","Deposited",
+        table(["Week Start","Week End","Status","Days","Expected","Deposits","Deposited",
           "Paid by Sunday","Fine","Week Balance","Balance to Date"],
           r.weeks.map(w=>[fmtDate(w.weekStart),fmtDate(w.weekEnd),
-            statusLabel(statusAt(c,w.weekEnd)),
+            statusLabel(statusAt(c,w.weekEnd)),{n:w.daysUnderContract},
             {n:money(w.expected)},{n:w.count},{n:money(w.deposited)},{n:money(w.paidBySunday)},
             {n:money(w.fine),cls:w.fine>0?"neg":""},bal(w.weekBalance),bal(w.balance)]))+
-        '<div class="hint" style="margin-top:8px">Fines are assessed when a week closes, based on '+
+        '<div class="hint" style="margin-top:8px">Each week expects only the days that fall '+
+        'inside the contract. Fines are assessed when a week closes, based on '+
         'the shortfall at that point. Unpaid expected carries into the next week.</div>'+
         '</div></details>';
     }).join("");
@@ -739,6 +778,7 @@ function contractForm(){
   const futureClose=term&&f.terminatedOn&&dayNum(f.terminatedOn)>dayNum(today());
   const earlyClose=term&&f.terminatedOn&&dayNum(f.terminatedOn)<dayNum(f.startDate);
   const endEff=term&&f.terminatedOn?f.terminatedOn:endAuto;
+  /* days under contract, both ends counted - the same rule the rollup uses */
   const dspan=(f.startDate&&endEff)?dayDiff(f.startDate,endEff)+1:0;
   const expTotal=dspan>0?dspan*numOf(f.dailyRate):0;
   return '<div class="grid2">'+
@@ -778,7 +818,8 @@ function contractForm(){
         " \u00B7 week "+money(numOf(f.dailyRate)*7):"")+'</div></div>'+
     '<div><label class="f">Total Expected Earnings (auto)</label>'+
       '<input class="i" id="cfExp" value="'+(expTotal?tzs(expTotal):"")+'" readonly>'+
-      '<div class="hint">Duration \u00D7 daily earning. Outstanding is measured against this.</div></div>'+
+      '<div class="hint">'+(dspan>0?dspan+" days \u00D7 "+money(numOf(f.dailyRate))+" per day. ":"")+
+      'Outstanding is measured against this.</div></div>'+
     '<div><label class="f">Fine Type</label>'+
       '<select class="i" data-cf="fineMode">'+FINE_MODES.map(m=>
         '<option value="'+m[0]+'"'+(f.fineMode===m[0]?" selected":"")+'>'+m[1]+'</option>').join("")+
@@ -878,8 +919,8 @@ function saveContract(){
     const R=contractRollup(probe);
     if(R.amountDue>0)
       return alert("This contract cannot be marked Completed.\n\nOutstanding: "+
-        tzs(R.amountDue)+" (expected "+tzs(R.totalExpected)+", deposited "+
-        tzs(R.totalDeposited)+").\n\nRecord the remaining deposits first, or use "+
+        tzs(R.amountDue)+" (expected "+tzs(R.totalExpected)+" for "+R.contractDays+
+        " days, deposited "+tzs(R.totalDeposited)+").\n\nRecord the remaining deposits first, or use "+
         "Terminated to close it while money is still owed.");
     if(R.finesOutstanding>0)
       return alert("This contract cannot be marked Completed.\n\nUnpaid fines: "+
@@ -901,18 +942,23 @@ function viewContract(id){
     ["Driver Phone",esc((d&&d.phone)||c.driverPhone||"\u2014")],["Plate",esc(plateOf(c))],
     ["Status",statusLabel(c.status)],["Start Date",fmtDate(c.startDate)],
     ["End Date",fmtDate(c.endDate)],["Termination Date",c.terminatedOn?fmtDate(c.terminatedOn):"\u2014"],
-    ["Duration",dur.trim()||"\u2014"],["Contracted Daily Earning",tzs(c.dailyRate)],
+    ["Duration",dur.trim()||"\u2014"],
+    ["Days Under Contract",r.contractDays],["Days to Date",r.daysToDate],
+    ["Contracted Daily Earning",tzs(c.dailyRate)],
     ["Contracted Weekly Earning",tzs((Number(c.dailyRate)||0)*7)],["Fine",fin],
     ["Referral",esc(c.referralName||"\u2014")],["Referral Phone",esc(c.referralPhone||"\u2014")],
     ["Weeks Recorded",r.weeksCounted],["Deposits",r.depositCount],["Late Weeks",r.weeksLate],
-    ["Total Expected Amount",tzs(r.totalExpected)],["Deposited Amount",tzs(r.totalDeposited)],
+    ["Total Expected Amount",tzs(r.totalExpected)+" ("+r.contractDays+" days \u00D7 "+
+      money(c.dailyRate)+")"],
+    ["Expected to Date",tzs(r.expectedToDate)+" ("+r.daysToDate+" days)"],
+    ["Deposited Amount",tzs(r.totalDeposited)],
     ["Outstanding",tzs(r.amountDue)],["Fines Charged",tzs(r.fines)],
     ["Fines Outstanding",tzs(r.finesOutstanding)],
     ["% Repaid (of expected)",r.percent.toFixed(1)+"%"],
     ["Motorcycle Purchase Price",tzs(c.purchasePrice)]];
   openModal("Contract Details",
     '<div class="kpis" style="grid-template-columns:1fr 1fr 1fr">'+
-      kpi("k3","Total Expected (TZS)",money(r.totalExpected))+
+      kpi("k3","Total Expected (TZS)",money(r.totalExpected),r.contractDays+" days under contract")+
       kpi("k1","Deposited (TZS)",money(r.totalDeposited))+
       kpi("k4","Outstanding (TZS)",money(r.amountDue))+'</div>'+
     '<table style="margin-top:16px"><tbody>'+rows.map(kv=>
@@ -938,12 +984,13 @@ function entryHTML(){
   const rate=c?Number(c.dailyRate)||0:0;
   const alreadyAll=wk?wk.deposited:0;
   const already=F.id&&wk?alreadyAll-(Number((db.deposits.find(x=>x.id===F.id)||{}).amount)||0):alreadyAll;
-  const expected=c?weekExpected(c,F.weekStart):0;
+  /* expected = days of this week under contract x daily rate */
+  const expected=c?weekExpectedByDays(c,F.weekStart):0;
   const after=already+numOf(F.amount);
 
   const weekEnd=addDays(F.weekStart,6);
   const closed=dayNum(weekEnd)<dayNum(today());
-  const daysOwed=rate>0?Math.round(expected/rate):0;
+  const daysOwed=c?contractDaysBetween(c,F.weekStart,weekEnd):0;
   const hasFine=!!(c&&c.fineMode&&c.fineMode!=="none"&&Number(c.fineAmount)>0);
   /* Week balance: everything banked against this week (including the entry
      being typed) minus what the week expects. Negative = still owed. */
@@ -1044,8 +1091,8 @@ function entryHTML(){
     h+='<div class="calc">'+
       '<div class="r"><span>Contracted daily earning (from contract)</span><b class="num">'+
         tzs(rate)+'</b></div>'+
-      '<div class="r"><span>Expected this week (7 days)</span><b class="num">'+
-        tzs(expected)+'</b></div>'+
+      '<div class="r"><span>Expected this week ('+daysOwed+' day'+(daysOwed===1?"":"s")+
+        ' under contract)</span><b class="num">'+tzs(expected)+'</b></div>'+
       (arrears>0?'<div class="r"><span>Arrears brought forward'+
         (priorFine-priorFinePaid>0?' (incl. '+tzs(priorFine-priorFinePaid)+' unpaid fines)':"")+
         '</span><b class="num neg">'+tzs(arrears)+'</b></div>':"")+
@@ -1509,7 +1556,7 @@ function sheetXml(rows){
   return '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'+
   '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'+
   '<cols><col min="1" max="1" width="26" customWidth="1"/>'+
-  '<col min="2" max="14" width="16" customWidth="1"/></cols>'+
+  '<col min="2" max="20" width="16" customWidth="1"/></cols>'+
   '<sheetData>'+body+'</sheetData></worksheet>';
 }
 function buildXlsx(rows,sheetName){
@@ -1603,13 +1650,14 @@ function contractRows(){
   const out=[[{t:"Contracts",s:TT}],[{t:"Reporting Period",s:B},{t:periodLabel()}],
     [{t:"Generated",s:B},{t:fmtDate(today())}],[],
     ["Contract ID","Driver Name","Driver Phone","Plate","Status","Start Date","End Date",
-     "Months","Weeks","Daily Rate","Fine Type","Fine Amount","Purchase Price",
-     "Total Expected","Expected to Date","Deposited",
+     "Months","Weeks","Days Under Contract","Days to Date","Daily Rate","Fine Type","Fine Amount",
+     "Purchase Price","Total Expected","Expected to Date","Deposited",
      "Outstanding","Referral","Referral Phone"].map(h=>({t:h,s:H}))];
   allRollups().forEach(r=>{const c=r.contract,d=driverById(c.driverId);
     out.push([{t:c.code||""},{t:d?d.name:""},{t:(d&&d.phone)||c.driverPhone||""},{t:plateOf(c)},
       {t:c.status},{t:c.startDate},{t:c.terminatedOn||c.endDate||""},
-      Number(c.durationMonths)||0,Number(c.durationWeeks)||0,Number(c.dailyRate)||0,
+      Number(c.durationMonths)||0,Number(c.durationWeeks)||0,r.contractDays,r.daysToDate,
+      Number(c.dailyRate)||0,
       {t:c.fineMode||"none"},Number(c.fineAmount)||0,Number(c.purchasePrice)||0,
       r.totalExpected,r.expectedToDate,
       r.totalDeposited,r.outstandingPrincipal,{t:c.referralName||""},{t:c.referralPhone||""}]);});
@@ -1715,18 +1763,22 @@ function exportContractsPdf(){
     [["Contracts",String(R.length)],["Active",String(act)],
      ["Terminated",String(R.filter(r=>r.contract.status==="terminated").length)],
      ["Ended",String(R.filter(r=>r.contract.status==="completed").length)],
+     ["Total Expected (TZS)",money(R.reduce((a,r)=>a+r.totalExpected,0))],
      ["Total Purchase Value (TZS)",money(R.reduce((a,r)=>a+r.purchasePrice,0))],
      ["Total Deposited (TZS)",money(R.reduce((a,r)=>a+r.totalDeposited,0))],
      ["Total Outstanding (TZS)",money(R.reduce((a,r)=>a+r.outstandingPrincipal,0))]],
     [{t:"Contract ID"},{t:"Driver"},{t:"Phone"},{t:"Plate"},{t:"Status"},{t:"Start"},{t:"End"},
-     {t:"Daily Rate",n:1},{t:"Fine"},{t:"Purchase",n:1},{t:"Deposited",n:1},{t:"Outstanding",n:1}],
+     {t:"Days",n:1},{t:"Daily Rate",n:1},{t:"Fine"},{t:"Total Expected",n:1},
+     {t:"Deposited",n:1},{t:"Outstanding",n:1}],
     R.map(r=>{const c=r.contract,d=driverById(c.driverId);
       return [c.code||"",d?d.name:"",(d&&d.phone)||c.driverPhone||"",plateOf(c),c.status,
-        fmtDate(c.startDate),fmtDate(c.terminatedOn||c.endDate),{n:1,t:money(c.dailyRate)},
+        fmtDate(c.startDate),fmtDate(c.terminatedOn||c.endDate),{n:1,t:String(r.contractDays)},
+        {n:1,t:money(c.dailyRate)},
         c.fineMode==="none"?"None":money(c.fineAmount)+"/"+(c.fineMode==="weekly"?"wk":"day"),
-        {n:1,t:money(c.purchasePrice)},{n:1,t:money(r.totalDeposited)},
+        {n:1,t:money(r.totalExpected)},{n:1,t:money(r.totalDeposited)},
         {n:1,t:money(r.outstandingPrincipal)}];}),
-    ["Reporting period: "+periodLabel(),"Generated: "+fmtDate(today())]));
+    ["Reporting period: "+periodLabel(),"Generated: "+fmtDate(today()),
+     "Total Expected = days under contract \u00D7 daily rate"]));
 }
 function exportDriversPdf(){
   const deps=filteredDeposits(), R=resolveRange();
